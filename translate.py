@@ -1,5 +1,13 @@
 import os
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
+from fastapi import (
+    FastAPI,
+    File,
+    UploadFile,
+    HTTPException,
+    BackgroundTasks,
+    Request,
+    Form,
+)
 from fastapi.responses import FileResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -9,14 +17,15 @@ from fpdf import FPDF
 from tqdm import tqdm
 from typing import List
 from tempfile import NamedTemporaryFile
+import arabic_reshaper
+from bidi.algorithm import get_display
 from contextlib import contextmanager
 from typing import Optional
 import argparse
 import logging
 import torch
 import torch.cuda
-import arabic_reshaper
-from bidi.algorithm import get_display
+import urllib.request
 
 
 class PDFExtractionError(Exception):
@@ -41,7 +50,8 @@ app = FastAPI()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(BASE_DIR)  # Change working directory to script location
 
-# Set fonts dir
+
+# Set fonts dir and download fonts if they don't exist
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 os.makedirs(FONTS_DIR, exist_ok=True)
 
@@ -158,7 +168,7 @@ def split_text(text: str, max_length: int = 512) -> List[str]:
 
 
 # Extract text from PDF
-def extract_text_from_pdf(pdf_path: str) -> List[str]:
+def extract_text_from_pdf(pdf_path: str, source_lang: str = "en") -> List[str]:
     try:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -180,6 +190,19 @@ def extract_text_from_pdf(pdf_path: str) -> List[str]:
         for i, page in enumerate(reader.pages):
             try:
                 text = page.extract_text()
+                # For Arabic source, we need to handle RTL text correctly
+                if source_lang == "ar":
+                    # Use get_display to convert visual RTL to logical LTR order
+                    text = get_display(text)
+                    # Split into lines and process each line
+                    lines = text.split("\n")
+                    # Process each line separately
+                    processed_lines = []
+                    for line in lines:
+                        if line.strip():
+                            # Convert each line to logical order
+                            processed_lines.append(get_display(line))
+                    text = "\n".join(processed_lines)
                 text_list.append(text)
                 total_text += text
             except Exception as e:
@@ -217,6 +240,7 @@ def translate_text(
         translated_texts = []
         with gpu_memory_manager():
             for page_num, text in enumerate(tqdm(text_list, desc="Translating pages")):
+                logger.info(f"Translating from {source_lang} to {target_lang}")
                 try:
                     if not text.strip():
                         translated_texts.append("")
@@ -265,6 +289,9 @@ def translate_text(
                     logger.error(f"Error processing page {page_num + 1}: {e}")
                     translated_texts.append(f"[Page Translation Error: {str(e)}]")
 
+        logger.info(
+            f"Sample of translated text: {translated_texts[0][:200] if translated_texts else 'No text'}"
+        )
         return translated_texts
 
     except Exception as e:
@@ -274,8 +301,17 @@ def translate_text(
 
 
 def create_translated_pdf(
-    original_pdf_path: str, translated_texts: List[str], target_lang: str = "en"
+    original_pdf_path: str,
+    translated_texts: List[str],
+    target_lang: str = "en",
+    source_lang: str = "en",
 ) -> str:
+    logger.info(
+        f"Creating PDF with target_lang: {target_lang}, source_lang: {source_lang}"
+    )
+    logger.info(
+        f"Sample of text to write: {translated_texts[0][:200] if translated_texts else 'No text'}"
+    )
     if not translated_texts:
         raise PDFCreationError("No translated texts provided")
 
@@ -283,20 +319,28 @@ def create_translated_pdf(
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
 
-        # For Arabic text
-        if target_lang == "ar":
-            # Make sure Amiri font exists
-            font_path = os.path.join(FONTS_DIR, "Amiri-Regular.ttf")
-            if not os.path.exists(font_path):
-                raise PDFCreationError(
-                    f"Arabic font not found at {font_path}. Please download Amiri font."
-                )
+        # Use DejaVu for non-Arabic text (handles all Unicode characters)
+        font_path = os.path.join(FONTS_DIR, "DejaVuSans.ttf")
+        if not os.path.exists(font_path):
+            raise PDFCreationError(
+                f"Unicode font not found at {font_path}. Please download DejaVu Sans font."
+            )
 
-            pdf.add_font("Amiri", "", font_path, uni=True)
+        # Only use Amiri font if target is Arabic
+        is_arabic_output = target_lang == "ar"
+
+        if is_arabic_output:
+            amiri_path = os.path.join(FONTS_DIR, "Amiri-Regular.ttf")
+            if not os.path.exists(amiri_path):
+                raise PDFCreationError(
+                    f"Arabic font not found at {amiri_path}. Please download Amiri font."
+                )
+            pdf.add_font("Amiri", "", amiri_path, uni=True)
             pdf.set_font("Amiri", size=14)
         else:
-            # For other languages, use default font
-            pdf.set_font("Helvetica", size=11)
+            # Use DejaVu Sans for non-Arabic (full Unicode support)
+            pdf.add_font("DejaVu", "", font_path, uni=True)
+            pdf.set_font("DejaVu", size=11)
 
         for page_num, text in enumerate(translated_texts):
             try:
@@ -309,21 +353,21 @@ def create_translated_pdf(
                 lines = text.split("\n")
                 for line in lines:
                     if line.strip():
-                        if target_lang == "ar":
-                            # Reshape Arabic text
+                        if is_arabic_output:
+                            # Only reshape and apply BIDI for Arabic output
                             reshaped_text = arabic_reshaper.reshape(line)
                             # Apply BIDI algorithm
                             bidi_text = get_display(reshaped_text)
                             pdf.set_font("Amiri", size=14)
                             pdf.multi_cell(0, 10, bidi_text, align="R")
                         else:
-                            pdf.set_font("Helvetica", size=11)
-                            pdf.multi_cell(0, 10, line)
+                            pdf.set_font("DejaVu", size=11)
+                            pdf.multi_cell(0, 10, line, align="L")
 
             except Exception as e:
                 logger.error(f"Error creating page {page_num + 1}: {e}")
                 pdf.add_page()
-                pdf.set_font("Helvetica", size=11)
+                pdf.set_font("DejaVu", size=11)
                 pdf.cell(0, 10, f"[Error creating page: {str(e)}]")
 
         output_path = os.path.join(
@@ -350,19 +394,19 @@ def create_translated_pdf(
 async def translate_pdf_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    source_lang: str = "en",
-    target_lang: str = "ar",
+    source_lang: str = Form(...),
+    target_lang: str = Form(...),
 ):
-
     temp_path = None
     output_path = None
+
+    logger.info(
+        f"Received file with source_lang={source_lang}, target_lang={target_lang}"
+    )
 
     # Validate inputs
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
-
-    if source_lang not in SUPPORTED_LANGUAGES or target_lang not in SUPPORTED_LANGUAGES:
-        raise HTTPException(status_code=400, detail="Unsupported language")
 
     # Check file size
     file_content = await file.read()
@@ -370,17 +414,37 @@ async def translate_pdf_endpoint(
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large")
 
+    # Validate languages after file size check
+    if source_lang not in SUPPORTED_LANGUAGES or target_lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=400, detail="Unsupported language")
+
     try:
         # Create secure temporary file
         with NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_path = temp_file.name
+            await file.seek(0)
+            file_content = await file.read()
             temp_file.write(file_content)
+
+        # Quick check of first page for Arabic characters
+        # reader = PdfReader(temp_path)
+        # if len(reader.pages) > 0:
+        #     first_page_text = reader.pages[0].extract_text()
+        #     has_arabic = any("\u0600" <= char <= "\u06FF" for char in first_page_text)
+        #     if has_arabic and source_lang != "ar":
+        #         logger.warning(
+        #             "Detected Arabic text but source_lang is not 'ar'. Adjusting languages."
+        #         )
+        #         source_lang = "ar"
 
         # Process the PDF
         model, tokenizer = get_model()
 
         try:
-            text_list = extract_text_from_pdf(temp_path)
+            text_list = extract_text_from_pdf(temp_path, source_lang)
+            logger.info(
+                f"Extracted text sample: {text_list[0][:200] if text_list else 'No text'}"
+            )
         except PDFExtractionError as e:
             raise HTTPException(
                 status_code=422,
@@ -400,7 +464,7 @@ async def translate_pdf_endpoint(
 
         try:
             output_path = create_translated_pdf(
-                temp_path, translated_texts, target_lang
+                temp_path, translated_texts, target_lang, source_lang
             )
         except PDFCreationError as e:
             raise HTTPException(
@@ -455,7 +519,9 @@ def main():
         translated_texts = translate_text(
             text_list, model, tokenizer, args.source_lang, args.target_lang
         )
-        output_path = create_translated_pdf(args.pdf_path, translated_texts)
+        output_path = create_translated_pdf(
+            args.pdf_path, translated_texts, args.target_lang, args.source_lang
+        )
         logger.info(f"Translation completed. Output saved to: {output_path}")
     except Exception as e:
         logger.error(f"Error: {e}")
